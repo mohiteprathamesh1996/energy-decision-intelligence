@@ -1,0 +1,90 @@
+# Oil Supply Chain Optimizer — Configuration
+# All physical/economic parameters are here. No magic numbers in code.
+
+planning:
+  default_horizon: 14          # days
+  max_horizon: 30
+  default_solver: "cbc"        # cbc | glpk | gurobi | cplex
+  solver_gap: 0.001            # 0.1% optimality gap
+  solver_timelimit: 300        # seconds
+
+stochastic:
+  n_scenarios: 10
+  annual_vol: 0.22             # Gulf Coast crack spread annualized vol (EIA 2020-2024)
+  seed: 42
+  confidence_level: 0.95       # for VaR/CVaR
+
+sensitivity:
+  delta_pct: 0.10              # ±10% parameter perturbation
+  bottleneck_threshold: 0.70   # utilization above which arc is considered tight
+  bottleneck_expand_bbl: 5000  # bbl/day added for marginal value estimation
+
+carbon:
+  default_budget_tco2_per_day: null   # null = unconstrained
+  intensity_units: "kg_CO2e_per_bbl"
+
+# ── Market Calibration ────────────────────────────────────────────────────────
+# Source: EIA Weekly Petroleum Status Report, 2020-2024 average
+
+crack_spreads:
+  R1_houston:
+    mean: 14.20
+    annual_vol: 0.22
+    label: "Gulf Coast 3-2-1 (light sweet)"
+  R2_port_arthur:
+    mean: 12.80
+    annual_vol: 0.20
+    label: "Gulf Coast 3-2-1 (heavy/coking)"
+  R3_beaumont:
+    mean: 13.50
+    annual_vol: 0.21
+    label: "Gulf Coast 3-2-1 (mid-range)"
+
+crude_grades:
+  WTI:
+    api_gravity: 40.8
+    sulfur_pct: 0.24
+    price_differential_usd_bbl: 0.00
+    carbon_intensity_kg_co2e_bbl: 8.5
+    note: "West Texas Intermediate — benchmark grade"
+  WTS:
+    api_gravity: 34.0
+    sulfur_pct: 1.52
+    price_differential_usd_bbl: -3.20
+    carbon_intensity_kg_co2e_bbl: 10.2
+    note: "West Texas Sour — ~$3/bbl discount to WTI (EIA crude marketing survey)"
+  HEAVY:
+    api_gravity: 27.5
+    sulfur_pct: 2.10
+    price_differential_usd_bbl: -7.40
+    carbon_intensity_kg_co2e_bbl: 11.8
+    note: "Permian Heavy Blend — higher water cut, more upstream processing"
+
+wti_benchmark_usd: 78.50      # approximate 2024 average
+
+# ── Pipeline Tariffs (FERC Form 6) ───────────────────────────────────────────
+pipeline_tariffs:
+  gathering_range: [1.80, 2.80]       # $/bbl intrastate gathering
+  permian_to_houston: [3.50, 4.50]   # $/bbl long-haul
+  permian_to_port_arthur: [3.80, 4.80]
+
+# ── Ship-or-Pay Contracts ─────────────────────────────────────────────────────
+# Reflects structure of public tariff filings for Permian-to-Gulf pipelines
+
+ship_or_pay:
+  T1_R1:
+    committed_bbl_per_day: 35000
+    tariff_usd_bbl: 3.20
+    deficiency_charge_usd_bbl: 1.80
+  T2_R2:
+    committed_bbl_per_day: 25000
+    tariff_usd_bbl: 3.40
+    deficiency_charge_usd_bbl: 1.60
+  T3_R2:
+    committed_bbl_per_day: 20000
+    tariff_usd_bbl: 3.90
+    deficiency_charge_usd_bbl: 1.50
+  T1_R3:
+    committed_bbl_per_day: 18000
+    tariff_usd_bbl: 3.50
+    deficiency_charge_usd_bbl: 1.70

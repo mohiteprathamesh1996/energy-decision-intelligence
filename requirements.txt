@@ -1,5 +1,37 @@
-pyomo>=6.7.0
-pyomo[optional]
-streamlit>=1.35.0
-plotly>=5.22.0
-pandas>=2.2.0
+# Core solver interface
+pyomo==6.7.3
+
+# Numerical computing
+numpy==1.26.4
+scipy==1.13.0
+
+# Data processing
+pandas==2.2.2
+
+# Visualization & dashboard
+plotly==5.22.0
+streamlit==1.35.0
+
+# Configuration
+pyyaml==6.0.1
+
+# Development / testing (install with: pip install -r requirements-dev.txt)
+# pytest==8.2.0
+# pytest-cov==5.0.0
+# pytest-timeout==2.3.1
+# ruff==0.4.8
+# mypy==1.10.0
+# ipykernel==6.29.4
+# notebook==7.2.1
+
+# ─────────────────────────────────────────────────────────────────
+# Solver installation (NOT via pip — must be system packages):
+#
+#   macOS:  brew install coin-or-tools        # installs CBC
+#   Ubuntu: sudo apt install coinor-cbc coinor-libcbc-dev
+#   Docker: see Dockerfile (CBC installed via apt)
+#
+# Production: replace CBC with Gurobi (requires license):
+#   pip install gurobipy
+#   Change: MultiPeriodOptimizer(net, solver="gurobi")
+# ─────────────────────────────────────────────────────────────────
