@@ -7,10 +7,10 @@ Results include delta analysis vs. the base case.
 import copy
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 from src.model.optimizer import MultiPeriodOptimizer, MultiPeriodResult
-from src.model.supply_chain import NodeType, SupplyChainNetwork
+from src.model.supply_chain import SupplyChainNetwork
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +51,12 @@ class ScenarioResult:
 
 
 class ScenarioRunner:
-    def __init__(self, base_network: SupplyChainNetwork, solver: str = "cbc"):
+    def __init__(self, base_network: SupplyChainNetwork):
         self.base_network = base_network
-        self.solver = solver
         self._base_result: Optional[MultiPeriodResult] = None
 
     def run_base(self) -> MultiPeriodResult:
-        opt = MultiPeriodOptimizer(copy.deepcopy(self.base_network), solver=self.solver)
+        opt = MultiPeriodOptimizer(copy.deepcopy(self.base_network))
         self._base_result = opt.solve()
         logger.info(f"Base case: ${self._base_result.objective_value:,.0f} | "
                     f"solver time {self._base_result.solver_time:.2f}s")
@@ -65,7 +64,7 @@ class ScenarioRunner:
 
     def run_scenario(self, scenario: Scenario) -> ScenarioResult:
         modified = scenario.modifier(copy.deepcopy(self.base_network))
-        opt = MultiPeriodOptimizer(modified, solver=self.solver)
+        opt = MultiPeriodOptimizer(modified)
         result = opt.solve()
         sr = ScenarioResult(
             scenario_name=scenario.name,
