@@ -258,10 +258,11 @@ class RollingHorizonOptimizer:
             for nid, n in network.nodes.items()
             if n.node_type == NodeType.REFINERY
         )
-        transport = sum(
-            (arc := network.arc_lookup(i, j)) and arc.transport_cost * flow or 0
-            for (i, j), flow in flows.items()
-        )
+        transport = 0.0
+        for (i, j), flow in flows.items():
+            arc = network.arc_lookup(i, j)
+            if arc is not None:
+                transport += arc.transport_cost * flow
         return revenue - transport
 
     def run(self) -> RollingHorizonResult:
