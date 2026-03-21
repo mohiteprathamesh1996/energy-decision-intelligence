@@ -35,7 +35,6 @@ st.set_page_config(
     page_title="Oil Supply Chain Optimizer",
     layout="wide",
     initial_sidebar_state="expanded",
-    page_icon="🛢️",
 )
 
 st.markdown("""
@@ -86,7 +85,7 @@ def _base_result():
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🛢️ Optimizer Controls")
+    st.markdown("## Optimizer Controls")
     st.markdown("---")
 
     st.markdown("**Planning Horizon**")
@@ -111,15 +110,15 @@ with st.sidebar:
     carbon_cap = st.number_input("Carbon Cap (tCO₂e/day, 0=none)", 0, 2000, 0, 50)
 
     st.markdown("---")
-    run_btn = st.button("▶  Run Optimization", use_container_width=True)
+    run_btn = st.button("Run Optimization", use_container_width=True)
 
     st.markdown("---")
     st.markdown("**Advanced Analysis**")
-    run_scenarios_btn = st.button("📊 Run All Scenarios", use_container_width=True)
-    run_stoch_btn = st.button("🎲 Stochastic Analysis", use_container_width=True)
-    run_sens_btn = st.button("🌪 Sensitivity Analysis", use_container_width=True)
-    run_rh_btn = st.button("🔄 Rolling Horizon (30d)", use_container_width=True)
-    run_forecast_btn = st.button("📈 Demand Forecast", use_container_width=True)
+    run_scenarios_btn = st.button("Run All Scenarios", use_container_width=True)
+    run_stoch_btn = st.button("Stochastic Analysis", use_container_width=True)
+    run_sens_btn = st.button("Sensitivity Analysis", use_container_width=True)
+    run_rh_btn = st.button("Rolling Horizon (30d)", use_container_width=True)
+    run_forecast_btn = st.button("Demand Forecast", use_container_width=True)
 
 
 # ── Build scenario network ────────────────────────────────────────────────────
@@ -170,9 +169,9 @@ c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1: kpi("Net Margin (Total)",   f"${result.objective_value:,.0f}",  f"vs base: ${delta_obj:+,.0f}", delta_obj >= 0)
 with c2: kpi("Gross Revenue",        f"${result.revenue:,.0f}")
 with c3: kpi("Transport Cost",       f"${result.transport_cost:,.0f}")
-with c4: kpi("Service Level",        f"{svc:.1f}%",      "✓ FULL" if svc >= 99 else ("⚠ PARTIAL" if svc >= 90 else "✗ CRITICAL"), svc >= 95)
+with c4: kpi("Service Level",        f"{svc:.1f}%",      "FULL" if svc >= 99 else ("PARTIAL" if svc >= 90 else "CRITICAL"), svc >= 95)
 with c5: kpi("Avg Carbon",           f"{avg_carbon:.0f} t/d", None)
-with c6: kpi("SOP Deficits",         f"{sop_total:,.0f} bbl", "✓ Clear" if sop_total < 100 else "⚠ Deficit", sop_total < 100)
+with c6: kpi("SOP Deficits",         f"{sop_total:,.0f} bbl", "Clear" if sop_total < 100 else "Deficit", sop_total < 100)
 
 st.markdown("")
 
@@ -180,8 +179,8 @@ st.markdown("")
 
 (tab_ov, tab_ops, tab_sc, tab_stoch,
  tab_rh, tab_fc, tab_carbon) = st.tabs([
-    "📍 Overview", "⚙ Operations", "📊 Scenarios",
-    "🎲 Stochastic", "🔄 Rolling Horizon", "📈 Forecasting", "🌿 Carbon",
+    "Overview", "Operations", "Scenarios",
+    "Stochastic", "Rolling Horizon", "Forecasting", "Carbon",
 ])
 
 # ─── OVERVIEW ────────────────────────────────────────────────────────────────
@@ -237,7 +236,7 @@ with tab_sc:
     if run_scenarios_btn or st.session_state.get("sc_results"):
         if run_scenarios_btn:
             with st.spinner("Running 9 scenarios…"):
-                runner = ScenarioRunner(copy.deepcopy(_base_net()), solver="cbc")
+                runner = ScenarioRunner(copy.deepcopy(_base_net()), )
                 runner._base_result = _base_result()
                 sc_results = runner.run_all(build_standard_scenarios(_base_net()))
             st.session_state["sc_results"] = sc_results
@@ -344,7 +343,7 @@ with tab_rh:
                     rolling_horizon=7,
                     simulation_days=30,
                     replan_trigger="always",
-                    solver="cbc",
+
                     noise_level=0.05,
                 )
                 rh_result = rh.run()
@@ -391,7 +390,7 @@ with tab_rh:
                     "Realized Margin ($)": f"${e.realized_margin:,.0f}",
                     "Gap ($)": f"${e.realized_margin - e.planned_margin:+,.0f}",
                     "Unmet Demand (bbl)": f"{sum(e.unmet_demand.values()):,.0f}",
-                    "Replanned": "✓" if e.replanned else "–",
+                    "Replanned": "Yes" if e.replanned else "No",
                 })
             st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
 
@@ -520,7 +519,7 @@ with tab_carbon:
     st.plotly_chart(c_fig, use_container_width=True, config={"displayModeBar": False})
 
     # Carbon Pareto: what if we tighten the budget incrementally?
-    if st.button("📉 Generate Carbon–Margin Pareto Curve", use_container_width=False):
+    if st.button("Generate Carbon-Margin Pareto Curve", use_container_width=False):
         with st.spinner("Solving at 6 carbon budget levels…"):
             import copy
             base_carbon = avg_carbon
