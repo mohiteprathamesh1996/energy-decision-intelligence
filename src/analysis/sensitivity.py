@@ -13,7 +13,7 @@ Both feed the tornado chart visualization.
 import copy
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List
 
 from src.model.optimizer import MultiPeriodOptimizer, MultiPeriodResult
 from src.model.supply_chain import NodeType, SupplyChainNetwork
@@ -48,7 +48,6 @@ def run_sensitivity(
     base_network: SupplyChainNetwork,
     base_result: MultiPeriodResult,
     delta_pct: float = 0.10,
-    solver: str = "cbc",
 ) -> List[SensitivityEntry]:
     """
     Perturb key parameters ±10% and measure objective change.
@@ -57,8 +56,7 @@ def run_sensitivity(
     base_obj = base_result.objective_value
 
     def solve_with(net: SupplyChainNetwork) -> float:
-        opt = MultiPeriodOptimizer(net, solver=solver)
-        return opt.solve().objective_value
+        return MultiPeriodOptimizer(net).solve().objective_value
 
     entries = []
 
@@ -66,8 +64,6 @@ def run_sensitivity(
     for nid, n in base_network.nodes.items():
         if n.node_type != NodeType.REFINERY:
             continue
-        for sign, label in [(+delta_pct, "up"), (-delta_pct, "down")]:
-            pass
 
         def _margin_obj(margin_mult, _nid=nid):
             net = copy.deepcopy(base_network)
@@ -156,7 +152,6 @@ class BottleneckReport:
 def identify_bottlenecks(
     network: SupplyChainNetwork,
     result: MultiPeriodResult,
-    solver: str = "cbc",
     capacity_expand_bbl: float = 5_000,
 ) -> List[BottleneckReport]:
     """
@@ -187,7 +182,7 @@ def identify_bottlenecks(
         net_exp = copy.deepcopy(network)
         exp_arc = net_exp.arc_lookup(i, j)
         exp_arc.capacity += capacity_expand_bbl
-        opt = MultiPeriodOptimizer(net_exp, solver=solver)
+        opt = MultiPeriodOptimizer(net_exp)
         exp_result = opt.solve()
         shadow_val = (exp_result.objective_value - result.objective_value) / capacity_expand_bbl
 
