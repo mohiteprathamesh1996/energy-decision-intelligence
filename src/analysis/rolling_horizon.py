@@ -180,7 +180,6 @@ class RollingHorizonOptimizer:
         rolling_horizon: int = 14,
         simulation_days: int = 30,
         replan_trigger: str = "always",
-        solver: str = "cbc",
         seed: int = 42,
         noise_level: float = 0.05,
     ):
@@ -188,7 +187,6 @@ class RollingHorizonOptimizer:
         self.rolling_horizon = rolling_horizon
         self.simulation_days = simulation_days
         self.trigger_fn = self.REPLAN_TRIGGERS.get(replan_trigger, self.REPLAN_TRIGGERS["always"])
-        self.solver = solver
         self.simulator = RealitySimulator(seed=seed)
         self.noise_level = noise_level
 
@@ -288,7 +286,7 @@ class RollingHorizonOptimizer:
         static_net = copy.deepcopy(self.base_network)
         static_net.planning_horizon = self.simulation_days
         try:
-            static_result = MultiPeriodOptimizer(static_net, solver=self.solver).solve()
+            static_result = MultiPeriodOptimizer(static_net).solve()
             result.static_plan_margin = sum(
                 self._compute_day_margin(
                     {(i, j): static_result.flows_by_period.get((i, j, t), 0)
@@ -313,7 +311,7 @@ class RollingHorizonOptimizer:
 
             # Solve rolling horizon
             try:
-                opt = MultiPeriodOptimizer(net, solver=self.solver)
+                opt = MultiPeriodOptimizer(net)
                 plan = opt.solve()
                 replanned = True
             except Exception as e:
