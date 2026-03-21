@@ -19,7 +19,6 @@ from src.model.supply_chain import (
 class TestNetworkConstruction:
     def test_build_base_network_node_count(self):
         net = build_base_network(horizon=7)
-        assert len(net.nodes) == 13   # 5 wells + 3 storage + 3 refineries + 2 dist + 5 demand - wait...
         # 5W + 3T + 3R + 2D + 5M = 18
         assert len(net.nodes) == 18
 
