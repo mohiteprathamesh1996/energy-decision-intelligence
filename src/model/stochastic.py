@@ -395,7 +395,8 @@ def _recourse_problem_ef(
     if prob.status not in (1,):
         raise RuntimeError(f"EF solver status: {pulp.LpStatus[prob.status]}")
 
-    rp = _val(prob.objective)
+    raw_rp = pulp.value(prob.objective)
+    rp = float(raw_rp) if raw_rp is not None else 0.0
 
     # Build per-scenario summary results
     sc_results = []
@@ -427,6 +428,7 @@ def _recourse_problem_ef(
             sop_deficits={(c.arc_origin, c.arc_dest, t): _val(deficit[(w, c.arc_origin, c.arc_dest, t)])
                           for c in net.contracts for t in periods},
             revenue=rev, transport_cost=tc, holding_cost=0, penalty_cost=0, sop_cost=0,
+            opex_cost=0, fixed_cost=0,
             carbon_by_period=carbon, solver_time=0, planning_horizon=T,
         ))
 

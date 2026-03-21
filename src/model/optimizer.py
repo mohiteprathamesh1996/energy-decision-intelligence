@@ -1,15 +1,21 @@
 """
-Multi-period MILP for oil supply chain optimization.
+Multi-period MILP for oil supply chain optimization — PuLP implementation.
 
-Formulation highlights:
-  - Grade-indexed flows and inventories (T × G × A variables)
-  - Crude diet enforcement via linearized bilinear blending constraints
+Key advantage over Pyomo: `pip install pulp` bundles CBC automatically.
+No system-level solver installation required.
+
+Formulation: 16 constraint families covering
+  - Well production with decline
+  - Grade-indexed flows (WTI / WTS / Heavy)
+  - Linearised crude diet blending (API gravity + sulfur)
+  - Storage inventory balance and capacity
   - Ship-or-pay contract deficiency tracking
-  - Time-varying crack spreads for scenario/stochastic integration
-  - Optional carbon budget constraint
-  - Well production decline over planning horizon
+  - Sweet-only pipeline restrictions
+  - Optional carbon budget
+  - Arc activation binaries (fixed-cost routes)
 
-Solver: CBC (open source). For production: Gurobi or CPLEX via same interface.
+Solver: PuLP bundled CBC  (pulp.PULP_CBC_CMD)
+Upgrade path: swap to Gurobi via pulp.GUROBI_CMD() — same API.
 """
 
 import logging
@@ -17,8 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import pyomo.environ as pyo
-from pyomo.opt import TerminationCondition
+import pulp
 
 from .supply_chain import NodeType, SupplyChainNetwork
 
@@ -30,53 +35,82 @@ class MultiPeriodResult:
     status: str
     objective_value: float
 
-    # Flows: (origin, dest, period, grade) -> bbl/day
+    # (origin, dest, period, grade) -> bbl/day
     flows_by_grade: Dict[Tuple[str, str, int, str], float]
-    # Aggregated: (origin, dest, period) -> bbl/day
+    # (origin, dest, period) -> bbl/day
     flows_by_period: Dict[Tuple[str, str, int], float]
-
-    # Inventory: (node_id, period, grade) -> bbl
+    # (node_id, period, grade) -> bbl
     inventories: Dict[Tuple[str, int, str], float]
-
-    # Unmet demand: (node_id, period) -> bbl/day
+    # (node_id, period) -> bbl/day
     unmet_demand: Dict[Tuple[str, int], float]
-
-    # Ship-or-pay deficits: (origin, dest, period) -> bbl/day
+    # (origin, dest, period) -> bbl/day
     sop_deficits: Dict[Tuple[str, str, int], float]
 
-    # Cost components (total over all periods)
     revenue: float
     transport_cost: float
     holding_cost: float
     penalty_cost: float
     sop_cost: float
+    opex_cost: float
+    fixed_cost: float
 
-    # Carbon: period -> tonnes CO2e/day
+    # period -> tonnes CO2e/day
     carbon_by_period: Dict[int, float]
 
     solver_time: float
     planning_horizon: int
 
 
+def _val(v) -> float:
+    """Safe variable value extraction."""
+    try:
+        r = pulp.value(v)
+        return max(0.0, float(r)) if r is not None else 0.0
+    except Exception:
+        return 0.0
+
+
 class MultiPeriodOptimizer:
     """
-    Single class handles both base case and scenario runs.
-    Pass crack_spread_multipliers to vary margins by (refinery, period).
+    Build and solve the multi-period MILP using PuLP + bundled CBC.
+
+    Parameters
+    ----------
+    network : SupplyChainNetwork
+    time_limit : int
+        Solver time limit in seconds (default 300).
+    gap : float
+        Relative MIP gap tolerance (default 0.001 = 0.1%).
+    verbose : bool
+        Print CBC solver log to stdout.
     """
 
-    def __init__(self, network: SupplyChainNetwork, solver: str = "cbc"):
+    def __init__(
+        self,
+        network: SupplyChainNetwork,
+        time_limit: int = 300,
+        gap: float = 0.001,
+        verbose: bool = False,
+    ):
         self.network = network
-        self.solver_name = solver
-        self.model: Optional[pyo.ConcreteModel] = None
+        self.time_limit = time_limit
+        self.gap = gap
+        self.verbose = verbose
+        self.prob: Optional[pulp.LpProblem] = None
+        self._x: dict = {}
+        self._s: dict = {}
+        self._u: dict = {}
+        self._deficit: dict = {}
+        self._y: dict = {}
+
+    # ── Build ─────────────────────────────────────────────────────────────────
 
     def build(
         self,
         crack_spread_multipliers: Optional[Dict[Tuple[str, int], float]] = None,
-    ) -> pyo.ConcreteModel:
+    ) -> pulp.LpProblem:
 
-        m = pyo.ConcreteModel("OilSupplyChain")
         net = self.network
-
         T = net.planning_horizon
         arc_keys = net.arc_index
         node_ids = list(net.nodes.keys())
@@ -84,330 +118,260 @@ class MultiPeriodOptimizer:
         periods = list(range(1, T + 1))
         mults = crack_spread_multipliers or {}
 
-        # ── Sets ─────────────────────────────────────────────────────────────
-
-        m.NODES = pyo.Set(initialize=node_ids)
-        m.ARCS = pyo.Set(initialize=arc_keys, dimen=2)
-        m.GRADES = pyo.Set(initialize=grade_ids)
-        m.PERIODS = pyo.Set(initialize=periods)
+        # Node type groups
+        well_ids     = [n for n in node_ids if net.nodes[n].node_type == NodeType.WELL]
+        storage_ids  = [n for n in node_ids if net.nodes[n].node_type == NodeType.STORAGE]
+        refinery_ids = [n for n in node_ids if net.nodes[n].node_type == NodeType.REFINERY]
+        dist_ids     = [n for n in node_ids if net.nodes[n].node_type == NodeType.DISTRIBUTION]
+        demand_ids   = [n for n in node_ids if net.nodes[n].node_type == NodeType.DEMAND]
 
         fixed_arcs = [k for k in arc_keys if net.arc_lookup(*k).fixed_cost > 0]
-        sop_arcs = [(c.arc_origin, c.arc_dest) for c in net.contracts]
+        sop_arcs   = [(c.arc_origin, c.arc_dest) for c in net.contracts]
+        sour_grades  = [g for g in grade_ids if net.grades[g].sulfur_content > 0.5]
+        sweet_arcs   = [(a.origin, a.destination) for a in net.arcs if not a.accepts_sour]
 
-        m.ARCS_FIXED = pyo.Set(initialize=fixed_arcs, dimen=2)
-        m.ARCS_SOP = pyo.Set(initialize=sop_arcs, dimen=2)
+        # ── Variables ─────────────────────────────────────────────────────────
 
-        # ── Parameters ───────────────────────────────────────────────────────
+        prob = pulp.LpProblem("OilSupplyChain", pulp.LpMaximize)
 
-        m.tau = pyo.Param(m.ARCS, initialize={net.arc_key(a): a.transport_cost for a in net.arcs})
-        m.cap = pyo.Param(m.ARCS, initialize={net.arc_key(a): a.capacity for a in net.arcs})
-        m.fixed_cost = pyo.Param(
-            m.ARCS_FIXED,
-            initialize={net.arc_key(a): a.fixed_cost for a in net.arcs if a.fixed_cost > 0},
-        )
+        x_idx = [(i, j, t, g) for (i, j) in arc_keys for t in periods for g in grade_ids]
+        x = pulp.LpVariable.dicts("x", x_idx, lowBound=0)
 
-        m.node_cap = pyo.Param(m.NODES, initialize={n: net.nodes[n].max_capacity for n in node_ids})
-        m.min_tp = pyo.Param(m.NODES, initialize={n: net.nodes[n].min_throughput for n in node_ids})
-        m.op_cost = pyo.Param(m.NODES, initialize={n: net.nodes[n].operating_cost for n in node_ids})
-        m.hold_cost = pyo.Param(m.NODES, initialize={n: net.nodes[n].holding_cost for n in node_ids})
-        m.demand = pyo.Param(m.NODES, initialize={n: net.nodes[n].demand for n in node_ids})
-        m.penalty = pyo.Param(m.NODES, initialize={n: net.nodes[n].unmet_penalty for n in node_ids})
+        s_idx = [(n, t, g) for n in storage_ids for t in periods for g in grade_ids]
+        s = pulp.LpVariable.dicts("s", s_idx, lowBound=0)
 
-        # Grade physical properties
-        m.API = pyo.Param(m.GRADES, initialize={g: net.grades[g].api_gravity for g in grade_ids})
-        m.sulfur = pyo.Param(m.GRADES, initialize={g: net.grades[g].sulfur_content for g in grade_ids})
-        m.carbon_int = pyo.Param(m.GRADES, initialize={g: net.grades[g].carbon_intensity for g in grade_ids})
+        u_idx = [(n, t) for n in demand_ids for t in periods]
+        u = pulp.LpVariable.dicts("u", u_idx, lowBound=0)
 
-        # Refinery crude diet bounds
-        m.API_lo = pyo.Param(m.NODES, initialize={
-            n: (net.nodes[n].crude_diet.api_min if net.nodes[n].crude_diet else 0.0)
-            for n in node_ids
-        })
-        m.API_hi = pyo.Param(m.NODES, initialize={
-            n: (net.nodes[n].crude_diet.api_max if net.nodes[n].crude_diet else 100.0)
-            for n in node_ids
-        })
-        m.sulfur_max = pyo.Param(m.NODES, initialize={
-            n: (net.nodes[n].crude_diet.sulfur_max if net.nodes[n].crude_diet else 10.0)
-            for n in node_ids
-        })
+        d_idx = [(i, j, t) for (i, j) in sop_arcs for t in periods]
+        deficit = pulp.LpVariable.dicts("deficit", d_idx, lowBound=0)
 
-        # Time-varying refinery margins
-        def margin_init(m, nid, t):
-            n = net.nodes[nid]
-            if n.node_type != NodeType.REFINERY:
-                return 0.0
-            return n.refinery_margin * mults.get((nid, t), 1.0)
+        y = pulp.LpVariable.dicts("y", fixed_arcs, cat="Binary") if fixed_arcs else {}
 
-        m.margin = pyo.Param(m.NODES, m.PERIODS, initialize=margin_init)
+        self._x = x; self._s = s; self._u = u
+        self._deficit = deficit; self._y = y
 
-        # Initial inventory by grade
-        m.init_inv = pyo.Param(m.NODES, m.GRADES, initialize={
-            (nid, g): net.nodes[nid].initial_inv_by_grade.get(g, 0.0)
-            for nid in node_ids
-            for g in grade_ids
-        })
+        # ── Helpers ───────────────────────────────────────────────────────────
 
-        # Well capacity with decline
-        m.well_cap = pyo.Param(m.NODES, m.PERIODS, initialize={
-            (nid, t): (
-                net.well_capacity(nid, t)
-                if net.nodes[nid].node_type == NodeType.WELL else 0.0
-            )
-            for nid in node_ids
-            for t in periods
-        })
-
-        # Ship-or-pay
-        m.sop_min = pyo.Param(m.ARCS_SOP, initialize={
-            (c.arc_origin, c.arc_dest): c.min_daily_volume for c in net.contracts
-        })
-        m.sop_def_charge = pyo.Param(m.ARCS_SOP, initialize={
-            (c.arc_origin, c.arc_dest): c.deficiency_charge for c in net.contracts
-        })
-
-        # ── Decision Variables ────────────────────────────────────────────────
-
-        m.x = pyo.Var(m.ARCS, m.PERIODS, m.GRADES, domain=pyo.NonNegativeReals)
-        m.s = pyo.Var(m.NODES, m.PERIODS, m.GRADES, domain=pyo.NonNegativeReals)
-        m.u = pyo.Var(m.NODES, m.PERIODS, domain=pyo.NonNegativeReals)
-        m.deficit = pyo.Var(m.ARCS_SOP, m.PERIODS, domain=pyo.NonNegativeReals)
-        m.y = pyo.Var(m.ARCS_FIXED, domain=pyo.Binary)
-
-        # ── Objective ────────────────────────────────────────────────────────
-
-        def total_inflow(nid, t):
-            return sum(
-                m.x[i, nid, t, g]
+        def inflow(nid, t):
+            return pulp.lpSum(
+                x[(i, nid, t, g)]
                 for i in node_ids if (i, nid) in arc_keys
                 for g in grade_ids
             )
 
-        def total_outflow(nid, t):
-            return sum(
-                m.x[nid, j, t, g]
+        def outflow(nid, t):
+            return pulp.lpSum(
+                x[(nid, j, t, g)]
                 for j in node_ids if (nid, j) in arc_keys
                 for g in grade_ids
             )
 
-        def obj_rule(m):
-            revenue = sum(
-                m.margin[nid, t] * total_inflow(nid, t)
-                for nid, n in net.nodes.items()
-                if n.node_type == NodeType.REFINERY
-                for t in periods
-            )
-            trans = sum(
-                m.tau[i, j] * m.x[i, j, t, g]
-                for (i, j) in arc_keys
-                for t in periods
-                for g in grade_ids
-            )
-            opex = sum(
-                m.op_cost[nid] * total_outflow(nid, t)
-                for nid in node_ids
-                for t in periods
-            )
-            holding = sum(
-                m.hold_cost[nid] * m.s[nid, t, g]
-                for nid in node_ids for t in periods for g in grade_ids
-            )
-            fixed = sum(m.fixed_cost[i, j] * m.y[i, j] for (i, j) in fixed_arcs)
-            sop = sum(
-                m.sop_def_charge[i, j] * m.deficit[i, j, t]
-                for (i, j) in sop_arcs for t in periods
-            )
-            pen = sum(
-                m.penalty[nid] * m.u[nid, t]
-                for nid, n in net.nodes.items()
-                if n.node_type == NodeType.DEMAND
-                for t in periods
-            )
-            return revenue - trans - opex - holding - fixed - sop - pen
+        def inflow_g(nid, t, g):
+            return pulp.lpSum(x[(i, nid, t, g)] for i in node_ids if (i, nid) in arc_keys)
 
-        m.obj = pyo.Objective(rule=obj_rule, sense=pyo.maximize)
+        def outflow_g(nid, t, g):
+            return pulp.lpSum(x[(nid, j, t, g)] for j in node_ids if (nid, j) in arc_keys)
 
-        # ── Constraints ──────────────────────────────────────────────────────
+        # ── Objective ─────────────────────────────────────────────────────────
 
-        # (C1) Wells produce only their primary grade
-        def grade_lock(m, nid, t, g):
-            n = net.nodes[nid]
-            if n.node_type != NodeType.WELL or n.primary_grade == g:
-                return pyo.Constraint.Skip
-            out = sum(m.x[nid, j, t, g] for j in node_ids if (nid, j) in arc_keys)
-            return out == 0
+        revenue = pulp.lpSum(
+            net.nodes[r].refinery_margin * mults.get((r, t), 1.0) * inflow(r, t)
+            for r in refinery_ids for t in periods
+        )
+        transport = pulp.lpSum(
+            net.arc_lookup(i, j).transport_cost * x[(i, j, t, g)]
+            for (i, j) in arc_keys for t in periods for g in grade_ids
+        )
+        opex = pulp.lpSum(
+            net.nodes[n].operating_cost * outflow(n, t)
+            for n in node_ids for t in periods
+            if net.nodes[n].operating_cost > 0
+        )
+        holding = pulp.lpSum(
+            net.nodes[n].holding_cost * s[(n, t, g)]
+            for n in storage_ids for t in periods for g in grade_ids
+        )
+        fixed_cost = (
+            pulp.lpSum(net.arc_lookup(i, j).fixed_cost * y[(i, j)] for (i, j) in fixed_arcs)
+            if fixed_arcs else 0
+        )
+        sop_cost = pulp.lpSum(
+            net.contract_lookup(i, j).deficiency_charge * deficit[(i, j, t)]
+            for (i, j) in sop_arcs for t in periods
+        )
+        penalty = pulp.lpSum(
+            net.nodes[n].unmet_penalty * u[(n, t)]
+            for n in demand_ids for t in periods
+        )
 
-        m.c_grade_lock = pyo.Constraint(m.NODES, m.PERIODS, m.GRADES, rule=grade_lock)
+        prob += revenue - transport - opex - holding - fixed_cost - sop_cost - penalty
 
-        # (C2) Well production capacity (period-specific, with decline)
-        def well_capacity(m, nid, t):
-            if net.nodes[nid].node_type != NodeType.WELL:
-                return pyo.Constraint.Skip
-            return (
-                sum(m.x[nid, j, t, g] for j in node_ids if (nid, j) in arc_keys for g in grade_ids)
-                <= m.well_cap[nid, t]
-            )
+        # ── Constraints ───────────────────────────────────────────────────────
 
-        m.c_well_cap = pyo.Constraint(m.NODES, m.PERIODS, rule=well_capacity)
+        # C1 — Well grade lock
+        for nid in well_ids:
+            pg = net.nodes[nid].primary_grade
+            for t in periods:
+                for g in grade_ids:
+                    if g == pg:
+                        continue
+                    prob += outflow_g(nid, t, g) == 0, f"grade_lock_{nid}_{t}_{g}"
 
-        # (C3) Storage flow balance — grade-indexed, period-linked
-        def storage_balance(m, nid, t, g):
-            if net.nodes[nid].node_type != NodeType.STORAGE:
-                return pyo.Constraint.Skip
-            inflow = sum(m.x[i, nid, t, g] for i in node_ids if (i, nid) in arc_keys)
-            outflow = sum(m.x[nid, j, t, g] for j in node_ids if (nid, j) in arc_keys)
-            prev = m.init_inv[nid, g] if t == 1 else m.s[nid, t - 1, g]
-            return prev + inflow == outflow + m.s[nid, t, g]
+        # C2 — Well production capacity with decline
+        for nid in well_ids:
+            for t in periods:
+                cap = net.well_capacity(nid, t)
+                prob += outflow(nid, t) <= cap, f"well_cap_{nid}_{t}"
 
-        m.c_storage_bal = pyo.Constraint(m.NODES, m.PERIODS, m.GRADES, rule=storage_balance)
+        # C3 — Storage flow balance (grade-indexed, period-linked)
+        for nid in storage_ids:
+            for t in periods:
+                for g in grade_ids:
+                    prev = (
+                        net.nodes[nid].initial_inv_by_grade.get(g, 0.0)
+                        if t == 1 else s[(nid, t - 1, g)]
+                    )
+                    prob += (
+                        prev + inflow_g(nid, t, g) == outflow_g(nid, t, g) + s[(nid, t, g)],
+                        f"stor_bal_{nid}_{t}_{g}",
+                    )
 
-        # (C4) Storage tank capacity ceiling (mixed grades share tank volume)
-        def storage_cap(m, nid, t):
-            if net.nodes[nid].node_type != NodeType.STORAGE:
-                return pyo.Constraint.Skip
-            return sum(m.s[nid, t, g] for g in grade_ids) <= m.node_cap[nid]
-
-        m.c_storage_cap = pyo.Constraint(m.NODES, m.PERIODS, rule=storage_cap)
-
-        # (C5/C6) Refinery throughput bounds
-        def ref_min(m, nid, t):
-            if net.nodes[nid].node_type != NodeType.REFINERY:
-                return pyo.Constraint.Skip
-            return total_inflow(nid, t) >= m.min_tp[nid]
-
-        def ref_max(m, nid, t):
-            if net.nodes[nid].node_type != NodeType.REFINERY:
-                return pyo.Constraint.Skip
-            return total_inflow(nid, t) <= m.node_cap[nid]
-
-        m.c_ref_min = pyo.Constraint(m.NODES, m.PERIODS, rule=ref_min)
-        m.c_ref_max = pyo.Constraint(m.NODES, m.PERIODS, rule=ref_max)
-
-        # (C7/C8) Crude diet: API gravity bounds
-        # Linearized bilinear: API_lo * Σx ≤ Σ(API_g * x) ≤ API_hi * Σx
-        def ref_api_lo(m, nid, t):
-            n = net.nodes[nid]
-            if n.node_type != NodeType.REFINERY or n.crude_diet is None:
-                return pyo.Constraint.Skip
-            inflows = [(i, g) for i in node_ids if (i, nid) in arc_keys for g in grade_ids]
-            weighted = sum(m.API[g] * m.x[i, nid, t, g] for i, g in inflows)
-            total = sum(m.x[i, nid, t, g] for i, g in inflows)
-            return weighted >= m.API_lo[nid] * total
-
-        def ref_api_hi(m, nid, t):
-            n = net.nodes[nid]
-            if n.node_type != NodeType.REFINERY or n.crude_diet is None:
-                return pyo.Constraint.Skip
-            inflows = [(i, g) for i in node_ids if (i, nid) in arc_keys for g in grade_ids]
-            weighted = sum(m.API[g] * m.x[i, nid, t, g] for i, g in inflows)
-            total = sum(m.x[i, nid, t, g] for i, g in inflows)
-            return weighted <= m.API_hi[nid] * total
-
-        m.c_api_lo = pyo.Constraint(m.NODES, m.PERIODS, rule=ref_api_lo)
-        m.c_api_hi = pyo.Constraint(m.NODES, m.PERIODS, rule=ref_api_hi)
-
-        # (C9) Crude diet: sulfur tolerance
-        def ref_sulfur(m, nid, t):
-            n = net.nodes[nid]
-            if n.node_type != NodeType.REFINERY or n.crude_diet is None:
-                return pyo.Constraint.Skip
-            inflows = [(i, g) for i in node_ids if (i, nid) in arc_keys for g in grade_ids]
-            weighted_s = sum(m.sulfur[g] * m.x[i, nid, t, g] for i, g in inflows)
-            total = sum(m.x[i, nid, t, g] for i, g in inflows)
-            return weighted_s <= m.sulfur_max[nid] * total
-
-        m.c_sulfur = pyo.Constraint(m.NODES, m.PERIODS, rule=ref_sulfur)
-
-        # (C10) Demand satisfaction with unmet slack
-        def demand_sat(m, nid, t):
-            if net.nodes[nid].node_type != NodeType.DEMAND:
-                return pyo.Constraint.Skip
-            return total_inflow(nid, t) + m.u[nid, t] >= m.demand[nid]
-
-        m.c_demand = pyo.Constraint(m.NODES, m.PERIODS, rule=demand_sat)
-
-        # (C11) Arc capacity (all grades share pipe capacity)
-        def arc_cap(m, i, j, t):
-            return sum(m.x[i, j, t, g] for g in grade_ids) <= m.cap[i, j]
-
-        m.c_arc_cap = pyo.Constraint(m.ARCS, m.PERIODS, rule=arc_cap)
-
-        # (C12) Fixed-cost arc activation (big-M)
-        def activation_link(m, i, j, t):
-            return sum(m.x[i, j, t, g] for g in grade_ids) <= m.cap[i, j] * m.y[i, j]
-
-        m.c_activation = pyo.Constraint(m.ARCS_FIXED, m.PERIODS, rule=activation_link)
-
-        # (C13) Ship-or-pay commitment
-        def sop_commitment(m, i, j, t):
-            return sum(m.x[i, j, t, g] for g in grade_ids) + m.deficit[i, j, t] >= m.sop_min[i, j]
-
-        m.c_sop = pyo.Constraint(m.ARCS_SOP, m.PERIODS, rule=sop_commitment)
-
-        # (C14) Distribution node flow conservation
-        def dist_balance(m, nid, t):
-            if net.nodes[nid].node_type != NodeType.DISTRIBUTION:
-                return pyo.Constraint.Skip
-            return total_inflow(nid, t) == total_outflow(nid, t)
-
-        m.c_dist = pyo.Constraint(m.NODES, m.PERIODS, rule=dist_balance)
-
-        # (C15) Carbon budget (optional hard constraint)
-        if net.carbon_budget_per_day is not None:
-            def carbon_budget(m, t):
-                return (
-                    sum(
-                        m.carbon_int[g] * m.x[i, j, t, g]
-                        for (i, j) in arc_keys
-                        for g in grade_ids
-                    ) / 1000.0  # kg -> tonnes
-                    <= net.carbon_budget_per_day
+        # C4 — Storage capacity (all grades share tank volume)
+        for nid in storage_ids:
+            cap = net.nodes[nid].max_capacity
+            for t in periods:
+                prob += (
+                    pulp.lpSum(s[(nid, t, g)] for g in grade_ids) <= cap,
+                    f"stor_cap_{nid}_{t}",
                 )
-            m.c_carbon = pyo.Constraint(m.PERIODS, rule=carbon_budget)
 
-        # (C16) Sour-restricted pipelines: no WTS/HEAVY on sweet-only arcs
-        sour_grades = [g for g in grade_ids if net.grades[g].sulfur_content > 0.5]
-        sweet_arcs = [(a.origin, a.destination) for a in net.arcs if not a.accepts_sour]
+        # C5/C6 — Refinery throughput bounds
+        for nid in refinery_ids:
+            lo = net.nodes[nid].min_throughput
+            hi = net.nodes[nid].max_capacity
+            for t in periods:
+                prob += inflow(nid, t) >= lo, f"ref_lo_{nid}_{t}"
+                prob += inflow(nid, t) <= hi, f"ref_hi_{nid}_{t}"
 
-        if sweet_arcs and sour_grades:
-            m.ARCS_SWEET = pyo.Set(initialize=sweet_arcs, dimen=2)
-            m.GRADES_SOUR = pyo.Set(initialize=sour_grades)
+        # C7/C8 — Crude diet: API gravity (linearised bilinear)
+        for nid in refinery_ids:
+            d = net.nodes[nid].crude_diet
+            if d is None:
+                continue
+            for t in periods:
+                pairs = [(i, g) for i in node_ids if (i, nid) in arc_keys for g in grade_ids]
+                if not pairs:
+                    continue
+                weighted = pulp.lpSum(net.grades[g].api_gravity * x[(i, nid, t, g)] for i, g in pairs)
+                total    = pulp.lpSum(x[(i, nid, t, g)] for i, g in pairs)
+                prob += weighted >= d.api_min * total, f"api_lo_{nid}_{t}"
+                prob += weighted <= d.api_max * total, f"api_hi_{nid}_{t}"
 
-            def sweet_only(m, i, j, t, g):
-                return m.x[i, j, t, g] == 0
+        # C9 — Crude diet: sulfur tolerance
+        for nid in refinery_ids:
+            d = net.nodes[nid].crude_diet
+            if d is None:
+                continue
+            for t in periods:
+                pairs = [(i, g) for i in node_ids if (i, nid) in arc_keys for g in grade_ids]
+                if not pairs:
+                    continue
+                weighted_s = pulp.lpSum(net.grades[g].sulfur_content * x[(i, nid, t, g)] for i, g in pairs)
+                total      = pulp.lpSum(x[(i, nid, t, g)] for i, g in pairs)
+                prob += weighted_s <= d.sulfur_max * total, f"sulfur_{nid}_{t}"
 
-            m.c_sweet_only = pyo.Constraint(
-                m.ARCS_SWEET, m.PERIODS, m.GRADES_SOUR, rule=sweet_only
-            )
+        # C10 — Demand satisfaction (soft, with penalty slack)
+        for nid in demand_ids:
+            d = net.nodes[nid].demand
+            for t in periods:
+                prob += inflow(nid, t) + u[(nid, t)] >= d, f"demand_{nid}_{t}"
 
-        self.model = m
-        return m
+        # C11 — Arc capacity (shared across all grades)
+        for (i, j) in arc_keys:
+            cap = net.arc_lookup(i, j).capacity
+            for t in periods:
+                prob += (
+                    pulp.lpSum(x[(i, j, t, g)] for g in grade_ids) <= cap,
+                    f"arc_cap_{i}_{j}_{t}",
+                )
 
-    def solve(self, tee: bool = False) -> MultiPeriodResult:
-        if self.model is None:
+        # C12 — Fixed-cost arc activation (big-M)
+        for (i, j) in fixed_arcs:
+            cap = net.arc_lookup(i, j).capacity
+            for t in periods:
+                prob += (
+                    pulp.lpSum(x[(i, j, t, g)] for g in grade_ids) <= cap * y[(i, j)],
+                    f"activation_{i}_{j}_{t}",
+                )
+
+        # C13 — Ship-or-pay commitment
+        for (i, j) in sop_arcs:
+            vmin = net.contract_lookup(i, j).min_daily_volume
+            for t in periods:
+                prob += (
+                    pulp.lpSum(x[(i, j, t, g)] for g in grade_ids) + deficit[(i, j, t)] >= vmin,
+                    f"sop_{i}_{j}_{t}",
+                )
+
+        # C14 — Distribution node flow conservation
+        for nid in dist_ids:
+            for t in periods:
+                prob += inflow(nid, t) == outflow(nid, t), f"dist_bal_{nid}_{t}"
+
+        # C15 — Carbon budget (optional)
+        if net.carbon_budget_per_day is not None:
+            budget = net.carbon_budget_per_day
+            for t in periods:
+                prob += (
+                    pulp.lpSum(
+                        net.grades[g].carbon_intensity * x[(i, j, t, g)] / 1000.0
+                        for (i, j) in arc_keys for g in grade_ids
+                    ) <= budget,
+                    f"carbon_{t}",
+                )
+
+        # C16 — Sweet-only pipeline restrictions
+        for (i, j) in sweet_arcs:
+            if (i, j) not in arc_keys:
+                continue
+            for t in periods:
+                for g in sour_grades:
+                    prob += x[(i, j, t, g)] == 0, f"sweet_{i}_{j}_{t}_{g}"
+
+        self.prob = prob
+        return prob
+
+    # ── Solve ─────────────────────────────────────────────────────────────────
+
+    def solve(self) -> MultiPeriodResult:
+        if self.prob is None:
             self.build()
 
-        solver = pyo.SolverFactory(self.solver_name)
-        if self.solver_name == "cbc":
-            solver.options["seconds"] = 300
-            solver.options["ratio"] = 0.001
-        elif self.solver_name == "glpk":
-            solver.options["tmlim"] = 300
+        solver = pulp.PULP_CBC_CMD(
+            msg=1 if self.verbose else 0,
+            timeLimit=self.time_limit,
+            gapRel=self.gap,
+        )
 
         t0 = time.time()
-        res = solver.solve(self.model, tee=tee)
+        self.prob.solve(solver)
         elapsed = time.time() - t0
 
-        status = str(res.solver.termination_condition)
-        if res.solver.termination_condition not in (
-            TerminationCondition.optimal, TerminationCondition.feasible
-        ):
-            logger.warning(f"Solver returned: {status}")
+        status_map = {
+            1: "optimal", 0: "not_solved",
+            -1: "infeasible", -2: "unbounded", -3: "undefined",
+        }
+        status = status_map.get(self.prob.status, "unknown")
+
+        if self.prob.status != 1:
+            logger.warning(f"Solver status: {status}")
 
         return self._extract(elapsed, status)
 
+    # ── Extract results ───────────────────────────────────────────────────────
+
     def _extract(self, elapsed: float, status: str) -> MultiPeriodResult:
-        m = self.model
         net = self.network
         arc_keys = net.arc_index
         grade_ids = net.grade_ids()
@@ -415,10 +379,11 @@ class MultiPeriodOptimizer:
         T = net.planning_horizon
         periods = list(range(1, T + 1))
 
-        def v(var): return max(0.0, pyo.value(var) or 0.0)
+        x = self._x; s = self._s; u = self._u
+        deficit = self._deficit
 
         flows_by_grade = {
-            (i, j, t, g): v(m.x[i, j, t, g])
+            (i, j, t, g): _val(x[(i, j, t, g)])
             for (i, j) in arc_keys for t in periods for g in grade_ids
         }
         flows_by_period = {
@@ -426,25 +391,27 @@ class MultiPeriodOptimizer:
             for (i, j) in arc_keys for t in periods
         }
         inventories = {
-            (nid, t, g): v(m.s[nid, t, g])
-            for nid in node_ids for t in periods for g in grade_ids
+            (nid, t, g): _val(s[(nid, t, g)])
+            for nid in node_ids
+            if net.nodes[nid].node_type == NodeType.STORAGE
+            for t in periods for g in grade_ids
         }
         unmet = {
-            (nid, t): v(m.u[nid, t])
-            for nid, n in net.nodes.items()
-            if n.node_type == NodeType.DEMAND
+            (nid, t): _val(u[(nid, t)])
+            for nid in node_ids
+            if net.nodes[nid].node_type == NodeType.DEMAND
             for t in periods
         }
-        sop_def = {
-            (c.arc_origin, c.arc_dest, t): v(m.deficit[c.arc_origin, c.arc_dest, t])
+        sop_deficits = {
+            (c.arc_origin, c.arc_dest, t): _val(deficit[(c.arc_origin, c.arc_dest, t)])
             for c in net.contracts for t in periods
         }
 
-        # Revenue uses time-varying margins
+        # Cost accounting
         revenue = sum(
-            (net.nodes[nid].refinery_margin * flows_by_period.get((i, nid, t), 0))
+            net.nodes[nid].refinery_margin
+            * sum(flows_by_period.get((i, nid, t), 0) for i in node_ids if (i, nid) in arc_keys)
             for nid, n in net.nodes.items() if n.node_type == NodeType.REFINERY
-            for i in node_ids if (i, nid) in arc_keys
             for t in periods
         )
         transport = sum(
@@ -452,17 +419,30 @@ class MultiPeriodOptimizer:
             for (i, j) in arc_keys for t in periods
         )
         holding = sum(
-            net.nodes[nid].holding_cost * inventories[(nid, t, g)]
-            for nid in node_ids for t in periods for g in grade_ids
+            net.nodes[nid].holding_cost * inventories.get((nid, t, g), 0)
+            for nid, n in net.nodes.items() if n.node_type == NodeType.STORAGE
+            for t in periods for g in grade_ids
         )
-        penalty = sum(
+        pen = sum(
             net.nodes[nid].unmet_penalty * unmet.get((nid, t), 0)
             for nid, n in net.nodes.items() if n.node_type == NodeType.DEMAND
             for t in periods
         )
         sop_cost = sum(
-            net.contract_lookup(c.arc_origin, c.arc_dest).deficiency_charge * sop_def.get((c.arc_origin, c.arc_dest, t), 0)
+            net.contract_lookup(c.arc_origin, c.arc_dest).deficiency_charge
+            * sop_deficits.get((c.arc_origin, c.arc_dest, t), 0)
             for c in net.contracts for t in periods
+        )
+        opex = sum(
+            net.nodes[nid].operating_cost
+            * sum(flows_by_period.get((nid, j, t), 0) for j in node_ids if (nid, j) in arc_keys)
+            for nid, n in net.nodes.items()
+            if n.operating_cost > 0
+            for t in periods
+        )
+        fixed = sum(
+            net.arc_lookup(i, j).fixed_cost * round(_val(self._y[(i, j)]))
+            for (i, j) in self._y
         )
         carbon_by_period = {
             t: sum(
@@ -472,19 +452,24 @@ class MultiPeriodOptimizer:
             for t in periods
         }
 
+        raw_obj = pulp.value(self.prob.objective)
+        obj_val = float(raw_obj) if raw_obj is not None else 0.0
+
         return MultiPeriodResult(
             status=status,
-            objective_value=v(m.obj),
+            objective_value=obj_val,
             flows_by_grade=flows_by_grade,
             flows_by_period=flows_by_period,
             inventories=inventories,
             unmet_demand=unmet,
-            sop_deficits=sop_def,
+            sop_deficits=sop_deficits,
             revenue=revenue,
             transport_cost=transport,
             holding_cost=holding,
-            penalty_cost=penalty,
+            penalty_cost=pen,
             sop_cost=sop_cost,
+            opex_cost=opex,
+            fixed_cost=fixed,
             carbon_by_period=carbon_by_period,
             solver_time=elapsed,
             planning_horizon=T,

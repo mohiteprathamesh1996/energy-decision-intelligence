@@ -164,10 +164,10 @@ def build_standard_scenarios(base_net: SupplyChainNetwork) -> List[Scenario]:
             modifier=transport_cost_shock(0.25),
         ),
         Scenario(
-            name="Carbon Budget – 850 t/day",
-            description="Regulatory carbon cap imposed at 850 tCO2e/day",
+            name="Carbon Budget – 4,500 t/day",
+            description="Regulatory carbon cap at 4,500 tCO2e/day (~22% below base)",
             category="policy",
-            modifier=carbon_budget_constraint(850.0),
+            modifier=carbon_budget_constraint(4500.0),
         ),
         Scenario(
             name="Wolfcamp Decline Acceleration",
