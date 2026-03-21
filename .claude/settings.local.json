@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(jupyter nbconvert:*)",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
